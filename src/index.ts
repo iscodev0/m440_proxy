@@ -1,17 +1,15 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
-type Bindings = { TARGET_ORIGIN: string; FLARESOLVERR_URL: string };
+type Bindings = { TARGET_ORIGIN: string };
 
 const app = new Hono<{ Bindings: Bindings }>();
 app.use('*', cors());
 
 // ── Browser headers ─────────────────────────────────────────
-const BROWSER_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
 const BROWSER_HEADERS: Record<string, string> = {
-  'User-Agent': BROWSER_UA,
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   Accept:
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'es-419,es;q=0.9,en;q=0.8',
@@ -24,106 +22,7 @@ const BROWSER_HEADERS: Record<string, string> = {
 // ── Helpers ─────────────────────────────────────────────────
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Cloudflare challenge detection ──────────────────────────
-function isCloudflareChallenge(status: number, contentType: string | null, body?: string): boolean {
-  if (status === 403 || status === 503) {
-    if (contentType?.includes('text/html')) {
-      if (body && (
-        body.includes('security verification') ||
-        body.includes('cf-challenge') ||
-        body.includes('challenge-platform') ||
-        body.includes('Just a moment') ||
-        body.includes('Checking your browser') ||
-        body.includes('cf_clearance')
-      )) {
-        return true;
-      }
-      // If no body to check but status is 403 with HTML, likely a challenge
-      if (!body && status === 403) return true;
-    }
-  }
-  return false;
-}
-
-// ── FlareSolverr cookie cache ───────────────────────────────
-interface CachedSession {
-  cookies: string;        // cookie header string
-  userAgent: string;
-  obtainedAt: number;
-}
-
-let cachedSession: CachedSession | null = null;
-const SESSION_TTL = 10 * 60 * 1000; // 10 minutes — refresh before Cloudflare expires it
-let solvingInProgress: Promise<CachedSession | null> | null = null;
-
-function getFlaresolverrUrl(): string {
-  return process.env.FLARESOLVERR_URL || 'http://flaresolverr:8191/v1';
-}
-
-async function solveChallenge(targetOrigin: string): Promise<CachedSession | null> {
-  // If another request is already solving, wait for it
-  if (solvingInProgress) {
-    return solvingInProgress;
-  }
-
-  solvingInProgress = (async () => {
-    const fsUrl = getFlaresolverrUrl();
-    console.log(`[FlareSolverr] Solving challenge for ${targetOrigin}...`);
-
-    try {
-      const res = await fetch(fsUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          cmd: 'request.get',
-          url: targetOrigin,
-          maxTimeout: 60000,
-        }),
-      });
-
-      const data = await res.json() as any;
-
-      if (data.status !== 'ok') {
-        console.log(`[FlareSolverr] Failed: ${data.message || 'unknown error'}`);
-        return null;
-      }
-
-      const cookies = (data.solution?.cookies || [])
-        .map((c: any) => `${c.name}=${c.value}`)
-        .join('; ');
-
-      const userAgent = data.solution?.userAgent || BROWSER_UA;
-
-      const session: CachedSession = {
-        cookies,
-        userAgent,
-        obtainedAt: Date.now(),
-      };
-
-      cachedSession = session;
-      console.log(`[FlareSolverr] OK — got ${data.solution?.cookies?.length || 0} cookies`);
-      return session;
-    } catch (err: any) {
-      console.log(`[FlareSolverr] Error: ${err.message}`);
-      return null;
-    } finally {
-      solvingInProgress = null;
-    }
-  })();
-
-  return solvingInProgress;
-}
-
-function getSession(): CachedSession | null {
-  if (!cachedSession) return null;
-  if (Date.now() - cachedSession.obtainedAt > SESSION_TTL) {
-    cachedSession = null;
-    return null;
-  }
-  return cachedSession;
-}
-
-// ── Proxy pool (fallback) ───────────────────────────────────
+// ── Proxy pool ──────────────────────────────────────────────
 interface ProxyEntry {
   host: string;
   port: number;
@@ -188,6 +87,7 @@ function getNextProxy(): ProxyState | null {
       for (const p of nonDead) p.cooldownUntil = 0;
       return getNextProxy();
     }
+    // All dead — partial score recovery as last resort
     for (const p of all) {
       p.cooldownUntil = 0;
       p.score = Math.max(0, p.score - 30);
@@ -203,31 +103,7 @@ function getNextProxy(): ProxyState | null {
   return pick;
 }
 
-// ── Fetch functions ─────────────────────────────────────────
-async function fetchDirect(
-  targetUrl: string,
-  headers: Record<string, string>,
-): Promise<{ status: number; contentType: string | null; body: ReadableStream | null; text?: string }> {
-  const res = await fetch(targetUrl, {
-    method: 'GET',
-    headers,
-    redirect: 'follow',
-  });
-
-  // Read body to check for Cloudflare challenge
-  const contentType = res.headers.get('content-type');
-  if (res.status === 403 || res.status === 503) {
-    const text = await res.text();
-    return { status: res.status, contentType, body: null, text };
-  }
-
-  return {
-    status: res.status,
-    contentType,
-    body: res.body,
-  };
-}
-
+// ── Fetch via proxy ─────────────────────────────────────────
 async function fetchViaProxy(
   targetUrl: string,
   proxy: ProxyEntry,
@@ -280,22 +156,20 @@ app.get('/__stats', (c) => {
   return c.json({
     total: proxyPool.size,
     available: all.filter(p => !p.cooldown && !p.dead).length,
-    session: cachedSession ? {
-      age: `${Math.round((Date.now() - cachedSession.obtainedAt) / 1000)}s`,
-      cookieCount: cachedSession.cookies.split(';').length,
-    } : null,
+    onCooldown: all.filter(p => p.cooldown).length,
+    dead: all.filter(p => p.dead).length,
     proxies: all,
   });
 });
 
-// ── Main route ──────────────────────────────────────────────
+// ── Main route — ONLY through proxies, NEVER direct ─────────
 app.all('*', async (c) => {
   const target =
     c.env?.TARGET_ORIGIN || process.env.TARGET_ORIGIN || 'https://m440.in';
   const url = new URL(c.req.url);
   const targetUrl = target + url.pathname + url.search;
 
-  const baseHeaders: Record<string, string> = {
+  const headers: Record<string, string> = {
     ...BROWSER_HEADERS,
     Referer: target + '/',
     'Sec-Fetch-Dest': 'document',
@@ -304,97 +178,14 @@ app.all('*', async (c) => {
   };
 
   if (url.pathname.startsWith('/lasted') || url.pathname.startsWith('/api')) {
-    baseHeaders['Accept'] = 'application/json, text/plain, */*';
-    baseHeaders['Sec-Fetch-Dest'] = 'empty';
-    baseHeaders['Sec-Fetch-Mode'] = 'cors';
-    baseHeaders['X-Requested-With'] = 'XMLHttpRequest';
+    headers['Accept'] = 'application/json, text/plain, */*';
+    headers['Sec-Fetch-Dest'] = 'empty';
+    headers['Sec-Fetch-Mode'] = 'cors';
+    headers['X-Requested-With'] = 'XMLHttpRequest';
   }
 
-  // ── Step 1: try with cached FlareSolverr cookies ──────────
-  const session = getSession();
-  if (session) {
-    const headers = {
-      ...baseHeaders,
-      'User-Agent': session.userAgent,
-      Cookie: session.cookies,
-    };
-
-    try {
-      console.log(`[Cached] ${c.req.method} ${url.pathname}`);
-      const result = await fetchDirect(targetUrl, headers);
-
-      if (!isCloudflareChallenge(result.status, result.contentType, result.text)) {
-        if (result.status < 500) {
-          console.log(`  OK ${result.status} (cached session)`);
-          const respHeaders = new Headers();
-          if (result.contentType) respHeaders.set('Content-Type', result.contentType);
-          respHeaders.set('X-Proxy-Mode', 'flaresolverr-cached');
-
-          const body = result.text ? result.text : result.body;
-          return new Response(body as any, { status: result.status, headers: respHeaders });
-        }
-      } else {
-        console.log(`  ! Challenge detected — session expired, refreshing...`);
-        cachedSession = null;
-      }
-    } catch (err: any) {
-      console.log(`  X Cached session error: ${err.message}`);
-    }
-  }
-
-  // ── Step 2: try direct fetch (no cookies) ─────────────────
-  try {
-    console.log(`[Direct] ${c.req.method} ${url.pathname}`);
-    const result = await fetchDirect(targetUrl, baseHeaders);
-
-    if (!isCloudflareChallenge(result.status, result.contentType, result.text)) {
-      if (result.status < 500) {
-        console.log(`  OK ${result.status} (direct)`);
-        const respHeaders = new Headers();
-        if (result.contentType) respHeaders.set('Content-Type', result.contentType);
-        respHeaders.set('X-Proxy-Mode', 'direct');
-
-        const body = result.text ? result.text : result.body;
-        return new Response(body as any, { status: result.status, headers: respHeaders });
-      }
-    } else {
-      console.log(`  ! Cloudflare challenge on direct fetch`);
-    }
-  } catch (err: any) {
-    console.log(`  X Direct failed: ${err.message}`);
-  }
-
-  // ── Step 3: solve challenge with FlareSolverr ─────────────
-  const newSession = await solveChallenge(target);
-  if (newSession) {
-    const headers = {
-      ...baseHeaders,
-      'User-Agent': newSession.userAgent,
-      Cookie: newSession.cookies,
-    };
-
-    try {
-      console.log(`[FlareSolverr] Retrying ${url.pathname} with fresh cookies`);
-      const result = await fetchDirect(targetUrl, headers);
-
-      if (result.status < 500 && !isCloudflareChallenge(result.status, result.contentType, result.text)) {
-        console.log(`  OK ${result.status} (flaresolverr)`);
-        const respHeaders = new Headers();
-        if (result.contentType) respHeaders.set('Content-Type', result.contentType);
-        respHeaders.set('X-Proxy-Mode', 'flaresolverr');
-
-        const body = result.text ? result.text : result.body;
-        return new Response(body as any, { status: result.status, headers: respHeaders });
-      }
-      console.log(`  ! Still challenged after FlareSolverr — falling back to proxies`);
-    } catch (err: any) {
-      console.log(`  X FlareSolverr retry failed: ${err.message}`);
-    }
-  }
-
-  // ── Step 4: fallback to proxy pool ────────────────────────
   const maxAttempts = 8;
-  let lastError = 'flaresolverr + direct failed';
+  let lastError = '';
   let backoffMs = 1500;
 
   for (let i = 0; i < maxAttempts; i++) {
@@ -407,13 +198,14 @@ app.all('*', async (c) => {
 
     try {
       console.log(`[${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname} -> ${label} (score:${state.score})`);
-      const result = await fetchViaProxy(targetUrl, entry, baseHeaders);
+
+      const result = await fetchViaProxy(targetUrl, entry, headers);
 
       if (result.status === 503) {
         state.totalFail++;
         state.score += 10;
         state.cooldownUntil = Date.now() + COOLDOWN_MS;
-        console.log(`  ! 503 ${label} [score:${state.score}]`);
+        console.log(`  ! 503 ${label} [score:${state.score}] waiting ${backoffMs}ms`);
         lastError = `503 via ${label}`;
         await sleep(backoffMs);
         backoffMs = Math.min(backoffMs * 1.5, 10_000);
@@ -428,7 +220,10 @@ app.all('*', async (c) => {
       if (result.contentType) respHeaders.set('Content-Type', result.contentType);
       respHeaders.set('X-Proxy-Used', label);
 
-      return new Response(result.body as any, { status: result.status, headers: respHeaders });
+      return new Response(result.body as any, {
+        status: result.status,
+        headers: respHeaders,
+      });
     } catch (err: any) {
       state.totalFail++;
       state.score += 20;
@@ -440,7 +235,7 @@ app.all('*', async (c) => {
     }
   }
 
-  return c.json({ error: 'All attempts failed', last: lastError }, 502);
+  return c.json({ error: 'All proxies failed', last: lastError }, 502);
 });
 
 export default app;
