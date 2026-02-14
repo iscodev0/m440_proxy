@@ -14,6 +14,8 @@ interface ProxyEntry {
   host: string;
   port: number;
   type: 'http' | 'https' | 'socks4' | 'socks5';
+  username?: string;
+  password?: string;
 }
 
 interface ProxyState {
@@ -25,8 +27,33 @@ interface ProxyState {
   totalFail: number;
 }
 
-// HTTP/HTTPS proxies first — FlareSolverr only supports HTTP proxies
-const PRIMARY_PROXIES: ProxyEntry[] = [
+// ── Parse proxies from env ──────────────────────────────────
+// Format: PROXY_LIST="http://user:pass@host:port,socks5://host:port,http://host:port"
+function parseProxyList(raw: string): ProxyEntry[] {
+  const entries: ProxyEntry[] = [];
+  for (const part of raw.split(',')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    try {
+      const url = new URL(trimmed);
+      const type = url.protocol.replace(':', '') as ProxyEntry['type'];
+      if (!['http', 'https', 'socks4', 'socks5'].includes(type)) continue;
+      entries.push({
+        host: url.hostname,
+        port: parseInt(url.port) || (type === 'https' ? 443 : 80),
+        type,
+        username: url.username || undefined,
+        password: url.password || undefined,
+      });
+    } catch {
+      console.log(`[Pool] Skipping invalid proxy: ${trimmed}`);
+    }
+  }
+  return entries;
+}
+
+// Fallback hardcoded proxies (free, likely burned)
+const FALLBACK_PROXIES: ProxyEntry[] = [
   { host: '20.81.205.173', port: 80, type: 'http' },
   { host: '108.170.12.14', port: 80, type: 'http' },
   { host: '173.245.49.185', port: 80, type: 'http' },
@@ -50,17 +77,27 @@ const DEAD_THRESHOLD = 50;
 const proxyPool = new Map<string, ProxyState>();
 
 function makeLabel(p: ProxyEntry): string {
-  return `${p.type}://${p.host}:${p.port}`;
+  const auth = p.username ? `${p.username}:***@` : '';
+  return `${p.type}://${auth}${p.host}:${p.port}`;
 }
 
-for (const p of PRIMARY_PROXIES) {
-  const label = makeLabel(p);
-  proxyPool.set(label, {
-    entry: p, label, score: 0, cooldownUntil: 0,
-    totalSuccess: 0, totalFail: 0,
-  });
+function loadProxies() {
+  const envList = process.env.PROXY_LIST;
+  const proxies = envList ? parseProxyList(envList) : FALLBACK_PROXIES;
+  const source = envList ? 'PROXY_LIST env' : 'fallback (hardcoded)';
+
+  proxyPool.clear();
+  for (const p of proxies) {
+    const label = makeLabel(p);
+    proxyPool.set(label, {
+      entry: p, label, score: 0, cooldownUntil: 0,
+      totalSuccess: 0, totalFail: 0,
+    });
+  }
+  console.log(`[Pool] ${proxyPool.size} proxies loaded from ${source}`);
 }
-console.log(`[Pool] ${proxyPool.size} proxies loaded`);
+
+loadProxies();
 
 let roundRobinIndex = 0;
 
@@ -90,25 +127,22 @@ function getNextProxy(): ProxyState | null {
   return pick;
 }
 
-// Get only HTTP/HTTPS proxies (FlareSolverr doesn't support SOCKS)
 function getHttpProxies(): ProxyState[] {
   return Array.from(proxyPool.values())
     .filter(p => p.entry.type === 'http' || p.entry.type === 'https')
     .filter(p => p.score < DEAD_THRESHOLD);
 }
 
-// ── FlareSolverr session cache ──────────────────────────────
-// Cookies are tied to the proxy IP that solved the challenge,
-// so we store which proxy was used.
+// ── FlareSolverr ────────────────────────────────────────────
 interface CachedSession {
   cookies: string;
   userAgent: string;
-  proxy: ProxyEntry;   // must use THIS proxy with these cookies
+  proxy: ProxyEntry;
   obtainedAt: number;
 }
 
 let cachedSession: CachedSession | null = null;
-const SESSION_TTL = 10 * 60 * 1000; // 10 min
+const SESSION_TTL = 10 * 60 * 1000;
 let solvingInProgress: Promise<CachedSession | null> | null = null;
 
 function getFlaresolverrUrl(): string {
@@ -124,6 +158,11 @@ function getSession(): CachedSession | null {
   return cachedSession;
 }
 
+function buildProxyUrl(entry: ProxyEntry): string {
+  const auth = entry.username ? `${entry.username}:${entry.password || ''}@` : '';
+  return `${entry.type}://${auth}${entry.host}:${entry.port}`;
+}
+
 async function solveChallenge(targetOrigin: string): Promise<CachedSession | null> {
   if (solvingInProgress) return solvingInProgress;
 
@@ -136,12 +175,12 @@ async function solveChallenge(targetOrigin: string): Promise<CachedSession | nul
       return null;
     }
 
-    // Try each HTTP proxy until one solves the challenge
     for (const proxyState of httpProxies) {
       const { entry } = proxyState;
-      const proxyUrl = `http://${entry.host}:${entry.port}`;
+      const proxyUrl = buildProxyUrl(entry);
+      const proxyLabel = makeLabel(entry);
 
-      console.log(`[FlareSolverr] Solving via ${proxyUrl}...`);
+      console.log(`[FlareSolverr] Solving via ${proxyLabel}...`);
 
       try {
         const res = await fetch(fsUrl, {
@@ -158,15 +197,14 @@ async function solveChallenge(targetOrigin: string): Promise<CachedSession | nul
         const data = await res.json() as any;
 
         if (data.status !== 'ok') {
-          console.log(`  ! FlareSolverr failed via ${proxyUrl}: ${data.message || 'unknown'}`);
+          console.log(`  ! FlareSolverr failed: ${data.message || 'unknown'}`);
           continue;
         }
 
-        // Check if the response is actually a block page (not just a challenge)
         const responseHtml = data.solution?.response || '';
         if (responseHtml.includes('you have been blocked') || responseHtml.includes('block_headline')) {
-          console.log(`  ! Proxy ${proxyUrl} is blocked by Cloudflare`);
-          proxyState.score += 30; // penalize heavily
+          console.log(`  ! Proxy blocked by Cloudflare`);
+          proxyState.score += 30;
           continue;
         }
 
@@ -175,36 +213,32 @@ async function solveChallenge(targetOrigin: string): Promise<CachedSession | nul
           .join('; ');
 
         if (!cookies.includes('cf_clearance')) {
-          console.log(`  ! No cf_clearance cookie via ${proxyUrl}`);
+          console.log(`  ! No cf_clearance cookie`);
           continue;
         }
 
-        const userAgent = data.solution?.userAgent || '';
         const session: CachedSession = {
           cookies,
-          userAgent,
+          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
           proxy: entry,
           obtainedAt: Date.now(),
         };
 
         cachedSession = session;
-        console.log(`[FlareSolverr] OK via ${proxyUrl} — got cf_clearance`);
+        console.log(`[FlareSolverr] OK via ${proxyLabel} — got cf_clearance`);
         return session;
       } catch (err: any) {
-        console.log(`  X FlareSolverr error via ${proxyUrl}: ${err.message}`);
+        console.log(`  X FlareSolverr error: ${err.message}`);
         continue;
       }
     }
 
-    console.log(`[FlareSolverr] All proxies failed to solve challenge`);
+    console.log(`[FlareSolverr] All proxies failed`);
     return null;
   })();
 
-  try {
-    return await solvingInProgress;
-  } finally {
-    solvingInProgress = null;
-  }
+  try { return await solvingInProgress; }
+  finally { solvingInProgress = null; }
 }
 
 // ── Fetch via proxy ─────────────────────────────────────────
@@ -224,7 +258,8 @@ async function fetchViaProxy(
 
   if (isSocks) {
     const { SocksProxyAgent } = await import('socks-proxy-agent');
-    const agent = new SocksProxyAgent(`${proxy.type}://${proxy.host}:${proxy.port}`);
+    const socksUrl = buildProxyUrl(proxy);
+    const agent = new SocksProxyAgent(socksUrl);
     const res = await undiciRequest(targetUrl, {
       method: 'GET', headers, dispatcher: agent as any,
     });
@@ -232,7 +267,8 @@ async function fetchViaProxy(
     contentType = res.headers['content-type'] as string | null;
     body = res.body;
   } else {
-    const dispatcher = new ProxyAgent(`http://${proxy.host}:${proxy.port}`);
+    const proxyUrl = buildProxyUrl(proxy);
+    const dispatcher = new ProxyAgent(proxyUrl);
     const res = await proxyFetch(targetUrl, {
       method: 'GET', headers, dispatcher, redirect: 'follow',
     });
@@ -241,7 +277,6 @@ async function fetchViaProxy(
     body = res.body;
   }
 
-  // Check for Cloudflare challenge/block on 403/503
   if ((status === 403 || status === 503) && contentType?.includes('text/html')) {
     const chunks: Uint8Array[] = [];
     for await (const chunk of body) chunks.push(chunk);
@@ -291,6 +326,10 @@ app.get('/__stats', (c) => {
     }));
 
   const session = getSession();
+  if (session) {
+    session.userAgent =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0";
+  }
 
   return c.json({
     total: proxyPool.size,
@@ -304,6 +343,12 @@ app.get('/__stats', (c) => {
     } : null,
     proxies: all,
   });
+});
+
+// ── Reload proxies endpoint ─────────────────────────────────
+app.post('/__reload', (c) => {
+  loadProxies();
+  return c.json({ ok: true, total: proxyPool.size });
 });
 
 // ── Main route — NEVER uses server IP, ONLY proxies ─────────
@@ -328,12 +373,12 @@ app.all('*', async (c) => {
     baseHeaders['X-Requested-With'] = 'XMLHttpRequest';
   }
 
-  // ── Step 1: try with cached FlareSolverr cookies + its proxy ──
+  // ── Step 1: cached FlareSolverr cookies + its proxy ───────
   const session = getSession();
   if (session) {
     const headers = {
       ...baseHeaders,
-      'User-Agent': session.userAgent,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
       Cookie: session.cookies,
     };
 
@@ -346,22 +391,21 @@ app.all('*', async (c) => {
         const respHeaders = new Headers();
         if (result.contentType) respHeaders.set('Content-Type', result.contentType);
         respHeaders.set('X-Proxy-Mode', 'flaresolverr-cached');
-        respHeaders.set('X-Proxy-Used', makeLabel(session.proxy));
 
         const body = result.text ?? result.body;
         return new Response(body as any, { status: result.status, headers: respHeaders });
       }
 
-      console.log(`  ! Session expired or proxy blocked — clearing cache`);
+      console.log(`  ! Session expired — clearing cache`);
       cachedSession = null;
     } catch (err: any) {
-      console.log(`  X Cached session error: ${err.message}`);
+      console.log(`  X Cached error: ${err.message}`);
       cachedSession = null;
     }
   }
 
-  // ── Step 2: try proxy pool directly (some might not be challenged) ──
-  const maxAttempts = 8;
+  // ── Step 2: proxy pool directly ───────────────────────────
+  const maxAttempts = Math.min(proxyPool.size, 8);
   let lastError = '';
   let backoffMs = 1500;
   let needsChallengeSolve = false;
@@ -374,14 +418,12 @@ app.all('*', async (c) => {
 
     try {
       console.log(`[${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname} -> ${label} (score:${state.score})`);
-
       const result = await fetchViaProxy(targetUrl, entry, baseHeaders);
 
-      // Cloudflare challenge/block
       if (isCloudflareBlock(result.text)) {
         console.log(`  ! Cloudflare challenge/block via ${label}`);
         state.score += 5;
-        lastError = `cloudflare block via ${label}`;
+        lastError = `cloudflare via ${label}`;
         needsChallengeSolve = true;
         continue;
       }
@@ -390,7 +432,6 @@ app.all('*', async (c) => {
         state.totalFail++;
         state.score += 10;
         state.cooldownUntil = Date.now() + COOLDOWN_MS;
-        console.log(`  ! 503 ${label} [score:${state.score}]`);
         lastError = `503 via ${label}`;
         await sleep(backoffMs);
         backoffMs = Math.min(backoffMs * 1.5, 10_000);
@@ -399,63 +440,56 @@ app.all('*', async (c) => {
 
       state.totalSuccess++;
       state.score = Math.max(0, state.score - 1);
-      console.log(`  OK ${result.status} via ${label} [score:${state.score}]`);
+      console.log(`  OK ${result.status} via ${label}`);
 
       const respHeaders = new Headers();
       if (result.contentType) respHeaders.set('Content-Type', result.contentType);
       respHeaders.set('X-Proxy-Used', label);
 
-      return new Response(result.body as any, {
-        status: result.status,
-        headers: respHeaders,
-      });
+      return new Response(result.body as any, { status: result.status, headers: respHeaders });
     } catch (err: any) {
       state.totalFail++;
       state.score += 20;
       state.cooldownUntil = Date.now() + ERROR_COOLDOWN_MS;
-      console.log(`  X ${label} [score:${state.score}]: ${err.message}`);
+      console.log(`  X ${label}: ${err.message}`);
       lastError = `${label}: ${err.message}`;
       await sleep(1000);
       continue;
     }
   }
 
-  // ── Step 3: all proxies got challenged — use FlareSolverr ──
-  if (needsChallengeSolve) {
-    console.log(`[FlareSolverr] All proxies challenged — solving via FlareSolverr + proxy...`);
-    const newSession = await solveChallenge(target);
+  // ── Step 3: FlareSolverr + proxy ──────────────────────────
+  // if (needsChallengeSolve) {
+  //   console.log(`[FlareSolverr] Solving challenge...`);
+  //   const newSession = await solveChallenge(target);
 
-    if (newSession) {
-      const headers = {
-        ...baseHeaders,
-        'User-Agent': newSession.userAgent,
-        Cookie: newSession.cookies,
-      };
+  //   if (newSession) {
+  //     const headers = {
+  //       ...baseHeaders,
+  //       'User-Agent': newSession.userAgent,
+  //       Cookie: newSession.cookies,
+  //     };
 
-      try {
-        console.log(`[FlareSolverr] Retrying ${url.pathname} via ${makeLabel(newSession.proxy)}`);
-        const result = await fetchViaProxy(targetUrl, newSession.proxy, headers);
+  //     try {
+  //       const result = await fetchViaProxy(targetUrl, newSession.proxy, headers);
 
-        if (!isCloudflareBlock(result.text) && result.status < 500) {
-          console.log(`  OK ${result.status} (flaresolverr)`);
-          const respHeaders = new Headers();
-          if (result.contentType) respHeaders.set('Content-Type', result.contentType);
-          respHeaders.set('X-Proxy-Mode', 'flaresolverr');
-          respHeaders.set('X-Proxy-Used', makeLabel(newSession.proxy));
+  //       if (!isCloudflareBlock(result.text) && result.status < 500) {
+  //         console.log(`  OK ${result.status} (flaresolverr)`);
+  //         const respHeaders = new Headers();
+  //         if (result.contentType) respHeaders.set('Content-Type', result.contentType);
+  //         respHeaders.set('X-Proxy-Mode', 'flaresolverr');
 
-          const body = result.text ?? result.body;
-          return new Response(body as any, { status: result.status, headers: respHeaders });
-        }
-        console.log(`  ! Still blocked after FlareSolverr`);
-        lastError = 'flaresolverr solved but still blocked';
-      } catch (err: any) {
-        console.log(`  X FlareSolverr retry failed: ${err.message}`);
-        lastError = `flaresolverr: ${err.message}`;
-      }
-    } else {
-      lastError = 'flaresolverr could not solve challenge';
-    }
-  }
+  //         const body = result.text ?? result.body;
+  //         return new Response(body as any, { status: result.status, headers: respHeaders });
+  //       }
+  //       lastError = 'flaresolverr: still blocked';
+  //     } catch (err: any) {
+  //       lastError = `flaresolverr: ${err.message}`;
+  //     }
+  //   } else {
+  //     lastError = 'flaresolverr: could not solve';
+  //   }
+  // }
 
   return c.json({ error: 'All attempts failed', last: lastError }, 502);
 });
