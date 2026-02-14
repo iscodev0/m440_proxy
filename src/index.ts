@@ -6,9 +6,6 @@ type Bindings = { TARGET_ORIGIN: string };
 const app = new Hono<{ Bindings: Bindings }>();
 app.use('*', cors());
 
-// ── Detect runtime ──────────────────────────────────────────
-const isBun = typeof globalThis.Bun !== 'undefined';
-
 // ── Proxy types ─────────────────────────────────────────────
 interface ProxyEntry {
   host: string;
@@ -26,7 +23,7 @@ interface ProxyState {
   isPrimary: boolean;
 }
 
-// ── Primary proxies (only used in Bun) ──────────────────────
+// ── Primary proxies (fallback if direct fails) ─────────────
 const PRIMARY_PROXIES: ProxyEntry[] = [
   { host: '20.81.205.173', port: 80, type: 'http' },
   { host: '168.235.110.63', port: 3128, type: 'http' },
@@ -45,7 +42,7 @@ const PRIMARY_PROXIES: ProxyEntry[] = [
   { host: '116.99.238.62', port: 30025, type: 'socks4' },
 ];
 
-// ── Pool management (Bun only) ─────────────────────────────
+// ── Pool management ─────────────────────────────────────────
 const COOLDOWN_MS = 30_000;
 const ERROR_COOLDOWN_MS = 60_000;
 const DEAD_THRESHOLD = 50;
@@ -71,14 +68,10 @@ function addToPool(entry: ProxyEntry, isPrimary: boolean): boolean {
   return true;
 }
 
-if (isBun) {
-  for (const p of PRIMARY_PROXIES) {
-    addToPool(p, true);
-  }
-  console.log(`[Pool] ${proxyPool.size} proxies loaded (Bun mode)`);
-} else {
-  console.log(`[Worker] Running in Cloudflare Workers mode (direct fetch)`);
+for (const p of PRIMARY_PROXIES) {
+  addToPool(p, true);
 }
+console.log(`[Pool] ${proxyPool.size} proxies loaded`);
 
 // ── Smart proxy selection ───────────────────────────────────
 let roundRobinIndex = 0;
@@ -145,7 +138,7 @@ const BROWSER_HEADERS: Record<string, string> = {
 // ── Helpers ─────────────────────────────────────────────────
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Fetch via proxy (Bun only, dynamically imported) ────────
+// ── Fetch via proxy (uses undici + socks-proxy-agent) ───────
 async function fetchViaProxy(
   targetUrl: string,
   proxy: ProxyEntry,
@@ -190,7 +183,7 @@ async function fetchViaProxy(
   };
 }
 
-// ── Direct fetch (Cloudflare Workers) ───────────────────────
+// ── Direct fetch (no proxy, server's own IP) ────────────────
 async function fetchDirect(
   targetUrl: string,
   headers: Record<string, string>,
@@ -210,10 +203,6 @@ async function fetchDirect(
 
 // ── Stats endpoint ──────────────────────────────────────────
 app.get('/__stats', (c) => {
-  if (!isBun) {
-    return c.json({ mode: 'cloudflare-worker', message: 'Direct fetch, no proxy pool' });
-  }
-
   const all = Array.from(proxyPool.values())
     .sort((a, b) => a.score - b.score)
     .map(p => ({
@@ -229,7 +218,6 @@ app.get('/__stats', (c) => {
     }));
 
   return c.json({
-    mode: 'bun',
     total: proxyPool.size,
     available: all.filter(p => !p.cooldown && !p.dead).length,
     onCooldown: all.filter(p => p.cooldown).length,
@@ -260,52 +248,36 @@ app.all('*', async (c) => {
     headers['X-Requested-With'] = 'XMLHttpRequest';
   }
 
-  // ── Cloudflare Workers: direct fetch ──────────────────────
-  if (!isBun) {
-    const maxAttempts = 3;
-    let lastError = '';
+  // ── Step 1: try direct fetch first (fastest, no proxy overhead) ──
+  try {
+    console.log(`[Direct] ${c.req.method} ${url.pathname}`);
+    const directResult = await fetchDirect(targetUrl, headers);
 
-    for (let i = 0; i < maxAttempts; i++) {
-      try {
-        console.log(`[Worker][${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname}`);
-        const result = await fetchDirect(targetUrl, headers);
+    if (directResult.status !== 503 && directResult.status < 500) {
+      console.log(`  OK ${directResult.status} (direct)`);
+      const respHeaders = new Headers();
+      if (directResult.contentType) respHeaders.set('Content-Type', directResult.contentType);
+      respHeaders.set('X-Proxy-Mode', 'direct');
 
-        if (result.status === 503) {
-          console.log(`  ! 503 — retrying in ${1000 * (i + 1)}ms`);
-          lastError = '503 from origin';
-          await sleep(1000 * (i + 1));
-          continue;
-        }
-
-        console.log(`  OK ${result.status}`);
-        const respHeaders = new Headers();
-        if (result.contentType) respHeaders.set('Content-Type', result.contentType);
-        respHeaders.set('X-Proxy-Mode', 'direct');
-
-        return new Response(result.body as any, {
-          status: result.status,
-          headers: respHeaders,
-        });
-      } catch (err: any) {
-        console.log(`  X Error: ${err.message}`);
-        lastError = err.message;
-        await sleep(1000);
-        continue;
-      }
+      return new Response(directResult.body as any, {
+        status: directResult.status,
+        headers: respHeaders,
+      });
     }
-
-    return c.json({ error: 'Direct fetch failed', last: lastError }, 502);
+    console.log(`  ! ${directResult.status} (direct) — falling back to proxies`);
+  } catch (err: any) {
+    console.log(`  X Direct failed: ${err.message} — falling back to proxies`);
   }
 
-  // ── Bun: proxy pool ──────────────────────────────────────
+  // ── Step 2: fallback to proxy pool ──────────────────────────
   const maxAttempts = 8;
-  let lastError = '';
+  let lastError = 'direct fetch failed';
   let backoffMs = 1500;
 
   for (let i = 0; i < maxAttempts; i++) {
     const state = getNextProxy();
     if (!state) {
-      return c.json({ error: 'No proxies available' }, 502);
+      return c.json({ error: 'No proxies available', last: lastError }, 502);
     }
 
     const { entry, label } = state;
@@ -344,7 +316,7 @@ app.all('*', async (c) => {
     }
   }
 
-  return c.json({ error: 'All proxies failed', last: lastError }, 502);
+  return c.json({ error: 'All attempts failed', last: lastError }, 502);
 });
 
 export default app;
