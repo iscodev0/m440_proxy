@@ -4,8 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "bun --watch src/serve.ts",
-    "start": "bun src/serve.ts",
-    "deploy": "wrangler deploy"
+    "start": "bun src/serve.ts"
   },
   "dependencies": {
     "fs": "^0.0.1-security",
@@ -14,7 +13,8 @@
     "undici": "^7.22.0"
   },
   "devDependencies": {
-    "wrangler": "^4",
-    "@cloudflare/workers-types": "^4"
+    "@cloudflare/workers-types": "^4",
+    "@types/node": "^25.2.3",
+    "wrangler": "^4"
   }
 }

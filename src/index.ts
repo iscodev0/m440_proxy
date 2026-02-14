@@ -215,7 +215,7 @@ async function fetchViaProxy(
       method: 'GET',
       headers,
       dispatcher: agent as any,
-      maxRedirections: 5,
+      // redirectionLimitReached: true
     });
     return {
       status: res.statusCode,
