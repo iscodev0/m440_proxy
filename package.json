@@ -1,0 +1,20 @@
+{
+  "name": "m440-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/serve.ts",
+    "start": "bun src/serve.ts",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "fs": "^0.0.1-security",
+    "hono": "^4",
+    "socks-proxy-agent": "^8.0.5",
+    "undici": "^7.22.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4",
+    "@cloudflare/workers-types": "^4"
+  }
+}
