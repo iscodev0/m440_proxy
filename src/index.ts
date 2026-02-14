@@ -3,7 +3,7 @@ import { cors } from 'hono/cors';
 import { ProxyAgent, fetch as proxyFetch } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { request as undiciRequest } from 'undici';
-import { readFileSync, existsSync, watchFile } from 'hono/';
+import { readFileSync, existsSync, watchFile } from 'fs';
 import { resolve } from 'path';
 
 type Bindings = { TARGET_ORIGIN: string };
