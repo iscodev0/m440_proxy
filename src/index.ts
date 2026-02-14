@@ -1,15 +1,13 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { ProxyAgent, fetch as proxyFetch } from 'undici';
-import { SocksProxyAgent } from 'socks-proxy-agent';
-import { request as undiciRequest } from 'undici';
-// import { readFileSync, existsSync, watchFile } from 'fs';
-// import { resolve } from 'path';
 
 type Bindings = { TARGET_ORIGIN: string };
 
 const app = new Hono<{ Bindings: Bindings }>();
 app.use('*', cors());
+
+// ── Detect runtime ──────────────────────────────────────────
+const isBun = typeof globalThis.Bun !== 'undefined';
 
 // ── Proxy types ─────────────────────────────────────────────
 interface ProxyEntry {
@@ -21,15 +19,14 @@ interface ProxyEntry {
 interface ProxyState {
   entry: ProxyEntry;
   label: string;
-  // Scoring: lower = better. Starts at 0, +10 per 503, +20 per error, -1 per success
   score: number;
-  cooldownUntil: number; // timestamp when cooldown expires
+  cooldownUntil: number;
   totalSuccess: number;
   totalFail: number;
-  isPrimary: boolean; // true = hardcoded, false = from CSV
+  isPrimary: boolean;
 }
 
-// ── Primary proxies (hardcoded) ─────────────────────────────
+// ── Primary proxies (only used in Bun) ──────────────────────
 const PRIMARY_PROXIES: ProxyEntry[] = [
   { host: '20.81.205.173', port: 80, type: 'http' },
   { host: '168.235.110.63', port: 3128, type: 'http' },
@@ -48,10 +45,10 @@ const PRIMARY_PROXIES: ProxyEntry[] = [
   { host: '116.99.238.62', port: 30025, type: 'socks4' },
 ];
 
-// ── Pool management ─────────────────────────────────────────
-const COOLDOWN_MS = 30_000;       // 30s cooldown after 503
-const ERROR_COOLDOWN_MS = 60_000; // 60s cooldown after connection error
-const DEAD_THRESHOLD = 50;        // score >= this = proxy considered dead, skip it
+// ── Pool management (Bun only) ─────────────────────────────
+const COOLDOWN_MS = 30_000;
+const ERROR_COOLDOWN_MS = 60_000;
+const DEAD_THRESHOLD = 50;
 
 const proxyPool = new Map<string, ProxyState>();
 
@@ -61,11 +58,11 @@ function makeLabel(p: ProxyEntry): string {
 
 function addToPool(entry: ProxyEntry, isPrimary: boolean): boolean {
   const label = makeLabel(entry);
-  if (proxyPool.has(label)) return false; // dedupe
+  if (proxyPool.has(label)) return false;
   proxyPool.set(label, {
     entry,
     label,
-    score: isPrimary ? 0 : 5, // CSV proxies start with slight penalty
+    score: isPrimary ? 0 : 5,
     cooldownUntil: 0,
     totalSuccess: 0,
     totalFail: 0,
@@ -74,58 +71,14 @@ function addToPool(entry: ProxyEntry, isPrimary: boolean): boolean {
   return true;
 }
 
-// Load primary proxies
-for (const p of PRIMARY_PROXIES) {
-  addToPool(p, true);
+if (isBun) {
+  for (const p of PRIMARY_PROXIES) {
+    addToPool(p, true);
+  }
+  console.log(`[Pool] ${proxyPool.size} proxies loaded (Bun mode)`);
+} else {
+  console.log(`[Worker] Running in Cloudflare Workers mode (direct fetch)`);
 }
-
-// ── CSV loading ─────────────────────────────────────────────
-// const CSV_PATH = resolve(process.cwd(), 'ips_proxy_list.csv');
-
-// function loadCsvProxies(): number {
-//   if (!existsSync(CSV_PATH)) return 0;
-
-//   let added = 0;
-//   try {
-//     const content = readFileSync(CSV_PATH, 'utf-8');
-//     const lines = content.split('\n').slice(1); // skip header
-
-//     for (const line of lines) {
-//       const trimmed = line.trim();
-//       if (!trimmed || trimmed.startsWith('#')) continue;
-
-//       const parts = trimmed.split(',');
-//       if (parts.length < 3) continue;
-
-//       const host = parts[0].trim();
-//       const port = parseInt(parts[1].trim());
-//       const type = parts[2].trim().toLowerCase() as ProxyEntry['type'];
-
-//       if (!host || isNaN(port) || !['http', 'https', 'socks4', 'socks5'].includes(type)) continue;
-
-//       if (addToPool({ host, port, type }, false)) added++;
-//     }
-//   } catch (err: any) {
-//     console.log(`[CSV] Error loading ${CSV_PATH}: ${err.message}`);
-//   }
-
-//   return added;
-// }
-
-// Load CSV on startup
-// const csvAdded = loadCsvProxies();
-console.log(`[Pool] ${proxyPool.size} proxies total (${PRIMARY_PROXIES.length} primary + ${''} from CSV)`);
-
-// Hot-reload CSV when it changes
-try {
-  // watchFile(CSV_PATH, { interval: 5000 }, () => {
-  //   const before = proxyPool.size;
-  //   const added = loadCsvProxies();
-  //   if (added > 0) {
-  //     console.log(`[CSV] Hot-reloaded: +${added} new proxies (total: ${proxyPool.size})`);
-  //   }
-  // });
-} catch { /* ignore if watch fails */ }
 
 // ── Smart proxy selection ───────────────────────────────────
 let roundRobinIndex = 0;
@@ -134,33 +87,26 @@ function getNextProxy(): ProxyState | null {
   const now = Date.now();
   const all = Array.from(proxyPool.values());
 
-  // Filter: not on cooldown AND not dead
   const available = all.filter(
     p => p.cooldownUntil <= now && p.score < DEAD_THRESHOLD
   );
 
   if (available.length === 0) {
-    // All proxies exhausted — reset cooldowns for non-dead ones
     const nonDead = all.filter(p => p.score < DEAD_THRESHOLD);
     if (nonDead.length > 0) {
       for (const p of nonDead) p.cooldownUntil = 0;
       return getNextProxy();
     }
-    // All dead — full reset as last resort
     for (const p of all) {
       p.cooldownUntil = 0;
-      p.score = Math.max(0, p.score - 30); // partial score recovery
+      p.score = Math.max(0, p.score - 30);
     }
     return all.length > 0 ? all[0] : null;
   }
 
-  // Sort by score (best first), then round-robin within same-score tier
   available.sort((a, b) => a.score - b.score);
-
-  // Pick from the top tier (proxies within 5 points of the best)
   const bestScore = available[0].score;
   const topTier = available.filter(p => p.score <= bestScore + 5);
-
   const pick = topTier[roundRobinIndex % topTier.length];
   roundRobinIndex++;
   return pick;
@@ -168,7 +114,7 @@ function getNextProxy(): ProxyState | null {
 
 function onProxySuccess(state: ProxyState): void {
   state.totalSuccess++;
-  state.score = Math.max(0, state.score - 1); // reward
+  state.score = Math.max(0, state.score - 1);
 }
 
 function onProxy503(state: ProxyState): void {
@@ -199,15 +145,19 @@ const BROWSER_HEADERS: Record<string, string> = {
 // ── Helpers ─────────────────────────────────────────────────
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Fetch via proxy ─────────────────────────────────────────
+// ── Fetch via proxy (Bun only, dynamically imported) ────────
 async function fetchViaProxy(
   targetUrl: string,
   proxy: ProxyEntry,
   headers: Record<string, string>,
 ): Promise<{ status: number; contentType: string | null; body: any }> {
+  const { ProxyAgent, fetch: proxyFetch } = await import('undici');
+  const { request: undiciRequest } = await import('undici');
+
   const isSocks = proxy.type === 'socks4' || proxy.type === 'socks5';
 
   if (isSocks) {
+    const { SocksProxyAgent } = await import('socks-proxy-agent');
     const agent = new SocksProxyAgent(
       `${proxy.type}://${proxy.host}:${proxy.port}`,
     );
@@ -215,7 +165,6 @@ async function fetchViaProxy(
       method: 'GET',
       headers,
       dispatcher: agent as any,
-      // redirectionLimitReached: true
     });
     return {
       status: res.statusCode,
@@ -241,8 +190,30 @@ async function fetchViaProxy(
   };
 }
 
+// ── Direct fetch (Cloudflare Workers) ───────────────────────
+async function fetchDirect(
+  targetUrl: string,
+  headers: Record<string, string>,
+): Promise<{ status: number; contentType: string | null; body: ReadableStream | null }> {
+  const res = await fetch(targetUrl, {
+    method: 'GET',
+    headers,
+    redirect: 'follow',
+  });
+
+  return {
+    status: res.status,
+    contentType: res.headers.get('content-type'),
+    body: res.body,
+  };
+}
+
 // ── Stats endpoint ──────────────────────────────────────────
 app.get('/__stats', (c) => {
+  if (!isBun) {
+    return c.json({ mode: 'cloudflare-worker', message: 'Direct fetch, no proxy pool' });
+  }
+
   const all = Array.from(proxyPool.values())
     .sort((a, b) => a.score - b.score)
     .map(p => ({
@@ -258,6 +229,7 @@ app.get('/__stats', (c) => {
     }));
 
   return c.json({
+    mode: 'bun',
     total: proxyPool.size,
     available: all.filter(p => !p.cooldown && !p.dead).length,
     onCooldown: all.filter(p => p.cooldown).length,
@@ -288,6 +260,44 @@ app.all('*', async (c) => {
     headers['X-Requested-With'] = 'XMLHttpRequest';
   }
 
+  // ── Cloudflare Workers: direct fetch ──────────────────────
+  if (!isBun) {
+    const maxAttempts = 3;
+    let lastError = '';
+
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        console.log(`[Worker][${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname}`);
+        const result = await fetchDirect(targetUrl, headers);
+
+        if (result.status === 503) {
+          console.log(`  ! 503 — retrying in ${1000 * (i + 1)}ms`);
+          lastError = '503 from origin';
+          await sleep(1000 * (i + 1));
+          continue;
+        }
+
+        console.log(`  OK ${result.status}`);
+        const respHeaders = new Headers();
+        if (result.contentType) respHeaders.set('Content-Type', result.contentType);
+        respHeaders.set('X-Proxy-Mode', 'direct');
+
+        return new Response(result.body as any, {
+          status: result.status,
+          headers: respHeaders,
+        });
+      } catch (err: any) {
+        console.log(`  X Error: ${err.message}`);
+        lastError = err.message;
+        await sleep(1000);
+        continue;
+      }
+    }
+
+    return c.json({ error: 'Direct fetch failed', last: lastError }, 502);
+  }
+
+  // ── Bun: proxy pool ──────────────────────────────────────
   const maxAttempts = 8;
   let lastError = '';
   let backoffMs = 1500;
