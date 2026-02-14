@@ -3,8 +3,8 @@ import { cors } from 'hono/cors';
 import { ProxyAgent, fetch as proxyFetch } from 'undici';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { request as undiciRequest } from 'undici';
-import { readFileSync, existsSync, watchFile } from 'fs';
-import { resolve } from 'path';
+// import { readFileSync, existsSync, watchFile } from 'fs';
+// import { resolve } from 'path';
 
 type Bindings = { TARGET_ORIGIN: string };
 
@@ -80,51 +80,51 @@ for (const p of PRIMARY_PROXIES) {
 }
 
 // ── CSV loading ─────────────────────────────────────────────
-const CSV_PATH = resolve(process.cwd(), 'ips_proxy_list.csv');
+// const CSV_PATH = resolve(process.cwd(), 'ips_proxy_list.csv');
 
-function loadCsvProxies(): number {
-  if (!existsSync(CSV_PATH)) return 0;
+// function loadCsvProxies(): number {
+//   if (!existsSync(CSV_PATH)) return 0;
 
-  let added = 0;
-  try {
-    const content = readFileSync(CSV_PATH, 'utf-8');
-    const lines = content.split('\n').slice(1); // skip header
+//   let added = 0;
+//   try {
+//     const content = readFileSync(CSV_PATH, 'utf-8');
+//     const lines = content.split('\n').slice(1); // skip header
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
+//     for (const line of lines) {
+//       const trimmed = line.trim();
+//       if (!trimmed || trimmed.startsWith('#')) continue;
 
-      const parts = trimmed.split(',');
-      if (parts.length < 3) continue;
+//       const parts = trimmed.split(',');
+//       if (parts.length < 3) continue;
 
-      const host = parts[0].trim();
-      const port = parseInt(parts[1].trim());
-      const type = parts[2].trim().toLowerCase() as ProxyEntry['type'];
+//       const host = parts[0].trim();
+//       const port = parseInt(parts[1].trim());
+//       const type = parts[2].trim().toLowerCase() as ProxyEntry['type'];
 
-      if (!host || isNaN(port) || !['http', 'https', 'socks4', 'socks5'].includes(type)) continue;
+//       if (!host || isNaN(port) || !['http', 'https', 'socks4', 'socks5'].includes(type)) continue;
 
-      if (addToPool({ host, port, type }, false)) added++;
-    }
-  } catch (err: any) {
-    console.log(`[CSV] Error loading ${CSV_PATH}: ${err.message}`);
-  }
+//       if (addToPool({ host, port, type }, false)) added++;
+//     }
+//   } catch (err: any) {
+//     console.log(`[CSV] Error loading ${CSV_PATH}: ${err.message}`);
+//   }
 
-  return added;
-}
+//   return added;
+// }
 
 // Load CSV on startup
-const csvAdded = loadCsvProxies();
-console.log(`[Pool] ${proxyPool.size} proxies total (${PRIMARY_PROXIES.length} primary + ${csvAdded} from CSV)`);
+// const csvAdded = loadCsvProxies();
+console.log(`[Pool] ${proxyPool.size} proxies total (${PRIMARY_PROXIES.length} primary + ${''} from CSV)`);
 
 // Hot-reload CSV when it changes
 try {
-  watchFile(CSV_PATH, { interval: 5000 }, () => {
-    const before = proxyPool.size;
-    const added = loadCsvProxies();
-    if (added > 0) {
-      console.log(`[CSV] Hot-reloaded: +${added} new proxies (total: ${proxyPool.size})`);
-    }
-  });
+  // watchFile(CSV_PATH, { interval: 5000 }, () => {
+  //   const before = proxyPool.size;
+  //   const added = loadCsvProxies();
+  //   if (added > 0) {
+  //     console.log(`[CSV] Hot-reloaded: +${added} new proxies (total: ${proxyPool.size})`);
+  //   }
+  // });
 } catch { /* ignore if watch fails */ }
 
 // ── Smart proxy selection ───────────────────────────────────

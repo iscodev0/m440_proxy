@@ -5,7 +5,7 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"],
+    "types": ["@types/bun"],
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
   },
