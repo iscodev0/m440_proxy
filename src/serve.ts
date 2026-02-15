@@ -1,6 +1,6 @@
 import app from './index';
 
-const port = parseInt(process.env.PORT || '3118');
+const port = parseInt(process.env.PORT || '3228');
 
 
 Bun.serve({

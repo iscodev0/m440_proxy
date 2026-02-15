@@ -93,6 +93,14 @@ function parseProxyList(raw: string): ProxyEntry[] {
 import { readFileSync, appendFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 
+
+
+// ── Mode: local (direct fetch) vs production (impit + proxy) ─
+const IS_LOCAL = process.env.NODE_ENV! !== 'production';
+const DIRECT_COOLDOWN_MS = 12_000; // after 503, use proxies for 7s then retry direct
+let directCooldownUntil = 0;
+
+
 function loadProxiesFromFiles(): ProxyEntry[] {
   const entries: ProxyEntry[] = [];
   const srcDir = join(dirname(Bun.main), '.');
@@ -307,6 +315,9 @@ function initPool() {
 
 initPool();
 warmupLoop().catch(() => {});
+if (IS_LOCAL) {
+  console.log(`[Local] Direct fetch + proxy fallback on 503 (cooldown ${DIRECT_COOLDOWN_MS / 1000}s)`);
+}
 
 // ── Proxy selection ──────────────────────────────────────────
 let roundRobinIndex = 0;
@@ -407,7 +418,8 @@ app.post('/__reload', (c) => {
   return c.json({ ok: true, total: proxyPool.size });
 });
 
-// ── Main route — ONLY proven proxies ────────────────────────
+
+// ── Main route ──────────────────────────────────────────────
 app.all('*', async (c) => {
   const target = c.env?.TARGET_ORIGIN || process.env.TARGET_ORIGIN || 'https://m440.in';
   const url = new URL(c.req.url);
@@ -428,6 +440,41 @@ app.all('*', async (c) => {
     headers['X-Requested-With'] = 'XMLHttpRequest';
   }
 
+  // ── Local mode: direct first, fallback to proxy on 503 ──
+  if (IS_LOCAL) {
+    // Try direct if not in cooldown
+    if (Date.now() >= directCooldownUntil) {
+      const start = Date.now();
+      try {
+        const res = await fetch(targetUrl, { headers, redirect: 'follow' });
+        const body = await res.arrayBuffer();
+        const latencyMs = Date.now() - start;
+        const contentType = res.headers.get('content-type');
+
+        if (res.status === 503) {
+          // Rate-limited — switch to proxy for 7 seconds
+          directCooldownUntil = Date.now() + DIRECT_COOLDOWN_MS;
+          console.log(`  503 direct (${latencyMs}ms) ${url.pathname} → switching to proxy for ${DIRECT_COOLDOWN_MS / 1000}s`);
+          // Fall through to proxy logic below
+        } else {
+          console.log(`  OK ${res.status} direct (${latencyMs}ms) ${url.pathname}`);
+          const respHeaders = new Headers();
+          if (contentType) respHeaders.set('Content-Type', contentType);
+          respHeaders.set('X-Proxy-Used', 'direct');
+          respHeaders.set('X-Proxy-Latency', `${latencyMs}ms`);
+          return new Response(body, { status: res.status, headers: respHeaders });
+        }
+      } catch (err: any) {
+        console.log(`  X direct: ${err.message.split('\n')[0]} → trying proxy`);
+        directCooldownUntil = Date.now() + DIRECT_COOLDOWN_MS;
+        // Fall through to proxy logic below
+      }
+    } else {
+      console.log(`  [cooldown] direct skipped (${Math.ceil((directCooldownUntil - Date.now()) / 1000)}s left) ${url.pathname}`);
+    }
+  }
+
+  // ── Production mode: impit + proxy (Chrome TLS fingerprint) ──
   const provenCount = Array.from(proxyPool.values()).filter(p => p.proven).length;
   const available = provenCount > 0 ? provenCount : Array.from(proxyPool.values()).filter(p => p.score < DEAD_THRESHOLD && p.cooldownUntil <= Date.now()).length;
   const maxAttempts = Math.min(Math.max(available, 3), 5);

@@ -9,3 +9,9 @@ ip,anonymityLevel,asn,country,isp,latency,org,port,protocols,speed,upTime,upTime
 68.167.181.9,null,null,null,null,null,null,3128,http,null,null,N/A,N/A,2026-02-15T04:23:52.009Z,1131.00
 94.159.112.138,null,null,null,null,null,null,3128,http,null,null,N/A,N/A,2026-02-15T04:24:03.294Z,522.00
 77.110.125.30,null,null,null,null,null,null,65531,http,null,null,N/A,N/A,2026-02-15T04:27:19.590Z,852.00
+174.136.204.40,null,null,null,null,null,null,80,http,null,null,N/A,N/A,2026-02-15T04:47:26.301Z,396.00
+81.169.213.169,null,null,null,null,null,null,8888,http,null,null,N/A,N/A,2026-02-15T04:58:20.320Z,140.00
+72.56.59.17,null,null,null,null,null,null,61931,http,null,null,N/A,N/A,2026-02-15T04:58:22.167Z,1049.00
+104.238.30.58,null,null,null,null,null,null,63744,http,null,null,N/A,N/A,2026-02-15T04:58:23.579Z,1281.00
+162.223.90.144,null,null,null,null,null,null,80,http,null,null,N/A,N/A,2026-02-15T04:58:23.897Z,222.00
+45.22.209.157,null,null,null,null,null,null,8888,http,null,null,N/A,N/A,2026-02-15T06:14:53.827Z,1852.00
