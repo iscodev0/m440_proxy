@@ -33,7 +33,7 @@ interface ProxyState {
 
 const MAX_LATENCY_MS = 1200;       // preferred latency for proxy selection
 const WARMUP_ACCEPT_MS = 12_000;   // accept proxies up to 12s in warmup (HTTPS proxy handshake overhead)
-const WARMUP_TIMEOUT_MS = 20_000;  // give proxies time for HTTPS handshake + CF
+const WARMUP_TIMEOUT_MS = 12_000;  // give proxies time for HTTPS handshake + CF
 const REQUEST_TIMEOUT_MS = 15_000;
 const COOLDOWN_MS = 30_000;
 const ERROR_COOLDOWN_MS = 60_000;
