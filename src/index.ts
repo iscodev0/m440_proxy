@@ -22,19 +22,23 @@ interface ProxyEntry {
 interface ProxyState {
   entry: ProxyEntry;
   label: string;
-  score: number;
+  proven: boolean;      // passed warmup test
+  avgMs: number;        // real latency from warmup
+  score: number;        // penalty score
   cooldownUntil: number;
   totalSuccess: number;
   totalFail: number;
-  avgMs: number; // average latency
+  lastTestedAt: number; // last warmup test timestamp
 }
 
-const MAX_LATENCY_MS = 1200;
-const REQUEST_TIMEOUT_MS = 8_000;
+const MAX_LATENCY_MS = 1200;       // preferred latency for proxy selection
+const WARMUP_ACCEPT_MS = 12_000;   // accept proxies up to 12s in warmup (HTTPS proxy handshake overhead)
+const WARMUP_TIMEOUT_MS = 20_000;  // give proxies time for HTTPS handshake + CF
+const REQUEST_TIMEOUT_MS = 15_000;
 const COOLDOWN_MS = 30_000;
 const ERROR_COOLDOWN_MS = 60_000;
 const DEAD_THRESHOLD = 50;
-const REFRESH_INTERVAL_MS = 5 * 60_000;
+const RETEST_INTERVAL_MS = 3 * 60_000; // re-test proven proxies every 3 min
 const proxyPool = new Map<string, ProxyState>();
 
 function makeLabel(p: ProxyEntry): string {
@@ -53,8 +57,8 @@ function addToPool(proxies: ProxyEntry[]) {
     const label = makeLabel(p);
     if (!proxyPool.has(label)) {
       proxyPool.set(label, {
-        entry: p, label, score: 0, cooldownUntil: 0,
-        totalSuccess: 0, totalFail: 0, avgMs: 0,
+        entry: p, label, proven: false, avgMs: 0, score: 0,
+        cooldownUntil: 0, totalSuccess: 0, totalFail: 0, lastTestedAt: 0,
       });
       added++;
     }
@@ -85,159 +89,231 @@ function parseProxyList(raw: string): ProxyEntry[] {
   return entries;
 }
 
-// ── Auto-fetch fresh proxies (max 1200ms timeout) ───────────
-async function fetchFromProxyScrape(protocol: string): Promise<ProxyEntry[]> {
-  try {
-    const url = `https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=${protocol}&timeout=${MAX_LATENCY_MS}&anonymity=elite,anonymous`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return [];
-    const text = await res.text();
-    const entries: ProxyEntry[] = [];
-    for (const line of text.split('\n')) {
-      const match = line.trim().match(/^(https?|socks[45]):\/\/(\d+\.\d+\.\d+\.\d+):(\d+)$/);
-      if (match) {
-        entries.push({
-          type: match[1] as ProxyEntry['type'],
-          host: match[2],
-          port: parseInt(match[3]),
-        });
-      }
-    }
-    return entries;
-  } catch {
-    return [];
-  }
-}
+// ── Load proxies from local files ────────────────────────────
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
 
-async function fetchFromProxyScrapeV2(protocol: string): Promise<ProxyEntry[]> {
+function loadProxiesFromFiles(): ProxyEntry[] {
+  const entries: ProxyEntry[] = [];
+  const srcDir = join(dirname(Bun.main), '.');
+
+  // Load iphttps.txt — format: ip:port (all http type)
   try {
-    const url = `https://api.proxyscrape.com/v2/?request=displayproxies&protocol=${protocol}&timeout=${MAX_LATENCY_MS}&country=all&ssl=all&anonymity=all`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return [];
-    const text = await res.text();
-    const entries: ProxyEntry[] = [];
-    for (const line of text.split('\n')) {
+    const txt = readFileSync(join(srcDir, 'iphttps.txt'), 'utf-8');
+    for (const line of txt.split('\n')) {
       const match = line.trim().match(/^(\d+\.\d+\.\d+\.\d+):(\d+)$/);
       if (match) {
-        entries.push({
-          type: protocol as ProxyEntry['type'],
-          host: match[1],
-          port: parseInt(match[2]),
-        });
+        entries.push({ type: 'http', host: match[1], port: parseInt(match[2]) });
       }
     }
-    return entries;
-  } catch {
-    return [];
-  }
-}
-
-async function fetchFreshProxies(): Promise<ProxyEntry[]> {
-  console.log('[Fetch] Fetching fresh proxies (max %dms)...', MAX_LATENCY_MS);
-  const results = await Promise.allSettled([
-    fetchFromProxyScrape('http'),
-    fetchFromProxyScrape('socks4'),
-    fetchFromProxyScrape('socks5'),
-    fetchFromProxyScrapeV2('http'),
-    fetchFromProxyScrapeV2('socks4'),
-    fetchFromProxyScrapeV2('socks5'),
-  ]);
-
-  const all: ProxyEntry[] = [];
-  for (const r of results) {
-    if (r.status === 'fulfilled') all.push(...r.value);
+    console.log(`[Load] iphttps.txt: ${entries.length} proxies`);
+  } catch (e: any) {
+    console.log(`[Load] iphttps.txt not found: ${e.message}`);
   }
 
-  const seen = new Set<string>();
-  const unique: ProxyEntry[] = [];
-  for (const p of all) {
-    const key = `${p.host}:${p.port}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      unique.push(p);
+  // Load ips_proxy_list.csv — format: ip,...,port,protocols,...
+  const beforeCsv = entries.length;
+  try {
+    const csv = readFileSync(join(srcDir, 'ips_proxy_list.csv'), 'utf-8');
+    const lines = csv.split('\n');
+    for (let i = 1; i < lines.length; i++) { // skip header
+      const cols = lines[i].split(',').map(c => c.replace(/"/g, '').trim());
+      if (cols.length < 9) continue;
+      const ip = cols[0];
+      const port = cols[7];
+      const proto = cols[8] as ProxyEntry['type'];
+      if (!ip || !port || !['http', 'https', 'socks4', 'socks5'].includes(proto)) continue;
+      entries.push({ type: proto, host: ip, port: parseInt(port) });
     }
+    console.log(`[Load] ips_proxy_list.csv: ${entries.length - beforeCsv} proxies`);
+  } catch (e: any) {
+    console.log(`[Load] ips_proxy_list.csv not found: ${e.message}`);
   }
 
-  console.log(`[Fetch] Got ${unique.length} unique proxies`);
-  return unique;
+  return entries;
 }
 
-// ── Initialize pool ─────────────────────────────────────────
-async function initPool() {
+// ── Warmup: test proxies in background ──────────────────────
+const WARMUP_TARGET = 'https://m440.in/lasted';
+
+function isCloudflareBlock(text?: string): boolean {
+  if (!text) return false;
+  return text.includes('you have been blocked') ||
+    text.includes('block_headline') ||
+    text.includes('security verification') ||
+    text.includes('cf-challenge') ||
+    text.includes('challenge-platform') ||
+    text.includes('Just a moment');
+}
+
+async function testProxy(state: ProxyState, verbose = false): Promise<boolean> {
+  const proxyUrl = buildProxyUrl(state.entry);
+  const start = Date.now();
+  try {
+    const impit = new Impit({ browser: 'chrome', proxyUrl, timeout: WARMUP_TIMEOUT_MS });
+    const res = await impit.fetch(WARMUP_TARGET, {
+      headers: { 'Accept': 'application/json, text/plain, */*' },
+      redirect: 'follow',
+    });
+
+    const latencyMs = Date.now() - start;
+    state.lastTestedAt = Date.now();
+
+    // Read body once
+    const body = await res.text();
+
+    if ((res.status === 403 || res.status === 503) && isCloudflareBlock(body)) {
+      if (verbose) console.log(`  [test] ${state.label}: cloudflare (${latencyMs}ms)`);
+      state.score += 10;
+      if (state.score >= 20) state.proven = false;
+      return false;
+    }
+
+    if (res.status !== 200) {
+      if (verbose) console.log(`  [test] ${state.label}: status ${res.status} (${latencyMs}ms)`);
+      state.score += 5;
+      if (state.score >= 20) state.proven = false;
+      return false;
+    }
+
+    if (!body.startsWith('{"data"')) {
+      if (verbose) console.log(`  [test] ${state.label}: invalid body (${latencyMs}ms)`);
+      state.score += 5;
+      if (state.score >= 20) state.proven = false;
+      return false;
+    }
+
+    // Check latency — accept up to WARMUP_ACCEPT_MS (cold start overhead)
+    if (latencyMs > WARMUP_ACCEPT_MS) {
+      if (verbose) console.log(`  [test] ${state.label}: too slow ${latencyMs}ms > ${WARMUP_ACCEPT_MS}ms`);
+      state.score += 3;
+      return false;
+    }
+
+    state.proven = true;
+    state.avgMs = state.avgMs === 0 ? latencyMs : Math.round(state.avgMs * 0.7 + latencyMs * 0.3);
+    state.score = Math.max(0, state.score - 2);
+    return true;
+  } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    if (verbose) console.log(`  [test] ${state.label}: ${err.message.split('\n')[0]} (${latencyMs}ms)`);
+    state.lastTestedAt = Date.now();
+    state.score += 20;
+    state.cooldownUntil = Date.now() + ERROR_COOLDOWN_MS;
+    return false;
+  }
+}
+
+let warmupRunning = false;
+
+async function warmupLoop() {
+  while (true) {
+    warmupRunning = true;
+    const now = Date.now();
+    const all = Array.from(proxyPool.values());
+
+    // 1. Re-test proven proxies that haven't been tested recently (parallel)
+    const staleProven = all.filter(p => p.proven && now - p.lastTestedAt > RETEST_INTERVAL_MS);
+    if (staleProven.length > 0) {
+      const results = await Promise.allSettled(staleProven.map(p => testProxy(p)));
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled' && !r.value) {
+          console.log(`[Warmup] ${staleProven[i].label} lost proven status`);
+        }
+      });
+    }
+
+    // 2. Test untested proxies in parallel batches of 20
+    const untested = all.filter(p =>
+      !p.proven && p.score < DEAD_THRESHOLD && p.cooldownUntil <= now && p.lastTestedAt === 0
+    ).slice(0, 60);
+
+    let newProven = 0;
+    for (let i = 0; i < untested.length; i += 20) {
+      const chunk = untested.slice(i, i + 20);
+      const results = await Promise.allSettled(chunk.map(p => testProxy(p, true)));
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
+        if (r.status === 'fulfilled' && r.value) {
+          newProven++;
+          console.log(`[Warmup] + ${chunk[j].label} (${chunk[j].avgMs}ms)`);
+        }
+      }
+    }
+
+    const provenCount = all.filter(p => p.proven).length;
+    if (newProven > 0 || untested.length > 0) {
+      console.log(`[Warmup] Tested ${untested.length}, +${newProven} proven. Total proven: ${provenCount}/${proxyPool.size}`);
+    }
+
+    // 3. Purge dead
+    const dead: string[] = [];
+    for (const [label, state] of proxyPool) {
+      if (state.score >= DEAD_THRESHOLD) dead.push(label);
+    }
+    for (const label of dead) proxyPool.delete(label);
+    if (dead.length > 0) console.log(`[Pool] Purged ${dead.length} dead`);
+
+    warmupRunning = false;
+    // Wait before next batch (short if we still have untested proxies)
+    const hasUntested = Array.from(proxyPool.values()).some(p => !p.proven && p.score < DEAD_THRESHOLD && p.lastTestedAt === 0);
+    await sleep(hasUntested ? 2_000 : 30_000);
+  }
+}
+
+// ── Initialize ──────────────────────────────────────────────
+function initPool() {
   const envList = process.env.PROXY_LIST;
   if (envList) {
     const proxies = parseProxyList(envList);
     addToPool(proxies);
-    console.log(`[Pool] ${proxyPool.size} proxies loaded from PROXY_LIST env`);
-    return;
+    console.log(`[Pool] ${proxyPool.size} proxies from PROXY_LIST env`);
   }
-
-  const fresh = await fetchFreshProxies();
-  if (fresh.length > 0) addToPool(fresh);
-  console.log(`[Pool] ${proxyPool.size} proxies ready`);
+  const fileProxies = loadProxiesFromFiles();
+  addToPool(fileProxies);
+  console.log(`[Pool] ${proxyPool.size} total proxies loaded — server ready`);
 }
 
-function purgeDead() {
-  const dead: string[] = [];
-  for (const [label, state] of proxyPool) {
-    if (state.score >= DEAD_THRESHOLD) dead.push(label);
-  }
-  for (const label of dead) proxyPool.delete(label);
-  if (dead.length > 0) console.log(`[Pool] Purged ${dead.length} dead proxies`);
-}
+initPool();
+warmupLoop().catch(() => {});
 
-async function refreshLoop() {
-  while (true) {
-    await sleep(REFRESH_INTERVAL_MS);
-    purgeDead();
-    const fresh = await fetchFreshProxies();
-    const added = addToPool(fresh);
-    console.log(`[Pool] Refresh: +${added} new, ${proxyPool.size} total`);
-  }
-}
-
-await initPool();
-refreshLoop().catch(() => {});
-
-// ── Proxy selection (prioritize low latency) ────────────────
+// ── Proxy selection ──────────────────────────────────────────
 let roundRobinIndex = 0;
+let fallbackIndex = 0;
 
 function getNextProxy(): ProxyState | null {
   const now = Date.now();
-  const all = Array.from(proxyPool.values());
-  const available = all.filter(p => p.cooldownUntil <= now && p.score < DEAD_THRESHOLD);
+  const proven = Array.from(proxyPool.values()).filter(
+    p => p.proven && p.cooldownUntil <= now && p.score < DEAD_THRESHOLD
+  );
 
-  if (available.length === 0) {
-    const nonDead = all.filter(p => p.score < DEAD_THRESHOLD);
-    if (nonDead.length > 0) {
-      for (const p of nonDead) p.cooldownUntil = 0;
-      return getNextProxy();
-    }
-    for (const p of all) {
-      p.cooldownUntil = 0;
-      p.score = Math.max(0, p.score - 30);
-    }
-    return all.length > 0 ? all[0] : null;
+  if (proven.length > 0) {
+    proven.sort((a, b) => a.avgMs - b.avgMs);
+    const topTier = proven.slice(0, Math.max(3, Math.ceil(proven.length * 0.3)));
+    const pick = topTier[roundRobinIndex % topTier.length];
+    roundRobinIndex++;
+    return pick;
   }
 
-  // Sort by: proven fast first (has success + low avg), then untested, then slow
-  available.sort((a, b) => {
-    // Proxies with success are always preferred
-    if (a.totalSuccess > 0 && b.totalSuccess === 0) return -1;
-    if (b.totalSuccess > 0 && a.totalSuccess === 0) return 1;
-    // Both have success: sort by avgMs
-    if (a.totalSuccess > 0 && b.totalSuccess > 0) return a.avgMs - b.avgMs;
-    // Both untested: sort by score
+  // Fallback: pick untested or low-score proxies when no proven available
+  const fallback = Array.from(proxyPool.values()).filter(
+    p => !p.proven && p.cooldownUntil <= now && p.score < DEAD_THRESHOLD
+  );
+  if (fallback.length === 0) return null;
+
+  // Prefer untested first, then lowest score
+  fallback.sort((a, b) => {
+    if (a.lastTestedAt === 0 && b.lastTestedAt !== 0) return -1;
+    if (a.lastTestedAt !== 0 && b.lastTestedAt === 0) return 1;
     return a.score - b.score;
   });
 
-  const topTier = available.slice(0, Math.max(5, Math.ceil(available.length * 0.1)));
-  const pick = topTier[roundRobinIndex % topTier.length];
-  roundRobinIndex++;
+  const pick = fallback[fallbackIndex % Math.min(fallback.length, 20)];
+  fallbackIndex++;
   return pick;
 }
 
-// ── Fetch via impit (browser TLS fingerprint) ───────────────
+// ── Fetch via impit ─────────────────────────────────────────
 async function fetchViaImpit(
   targetUrl: string,
   proxy: ProxyEntry,
@@ -246,16 +322,8 @@ async function fetchViaImpit(
   const proxyUrl = buildProxyUrl(proxy);
   const start = Date.now();
 
-  const impit = new Impit({
-    browser: 'chrome',
-    proxyUrl,
-    timeout: REQUEST_TIMEOUT_MS,
-  });
-
-  const res = await impit.fetch(targetUrl, {
-    headers,
-    redirect: 'follow',
-  });
+  const impit = new Impit({ browser: 'chrome', proxyUrl, timeout: REQUEST_TIMEOUT_MS });
+  const res = await impit.fetch(targetUrl, { headers, redirect: 'follow' });
 
   const status = res.status;
   const contentType = res.headers.get('content-type');
@@ -270,20 +338,9 @@ async function fetchViaImpit(
   return { status, contentType, body, latencyMs };
 }
 
-function isCloudflareBlock(text?: string): boolean {
-  if (!text) return false;
-  return text.includes('you have been blocked') ||
-    text.includes('block_headline') ||
-    text.includes('security verification') ||
-    text.includes('cf-challenge') ||
-    text.includes('challenge-platform') ||
-    text.includes('Just a moment');
-}
-
 // ── Browser headers ─────────────────────────────────────────
 const BROWSER_HEADERS: Record<string, string> = {
-  Accept:
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
   'Accept-Language': 'es-419,es;q=0.9,en;q=0.8',
   DNT: '1',
   'Upgrade-Insecure-Requests': '1',
@@ -291,49 +348,38 @@ const BROWSER_HEADERS: Record<string, string> = {
 
 // ── Stats endpoint ──────────────────────────────────────────
 app.get('/__stats', (c) => {
-  const all = Array.from(proxyPool.values())
-    .sort((a, b) => {
-      if (a.totalSuccess > 0 && b.totalSuccess === 0) return -1;
-      if (b.totalSuccess > 0 && a.totalSuccess === 0) return 1;
-      if (a.totalSuccess > 0 && b.totalSuccess > 0) return a.avgMs - b.avgMs;
-      return a.score - b.score;
-    })
-    .map(p => ({
-      proxy: p.label,
-      score: p.score,
-      avgMs: p.avgMs || null,
-      success: p.totalSuccess,
-      fail: p.totalFail,
-      cooldown: p.cooldownUntil > Date.now()
-        ? `${Math.ceil((p.cooldownUntil - Date.now()) / 1000)}s`
-        : null,
-      dead: p.score >= DEAD_THRESHOLD,
-    }));
+  const all = Array.from(proxyPool.values());
+  const provenList = all
+    .filter(p => p.proven)
+    .sort((a, b) => a.avgMs - b.avgMs)
+    .map(p => ({ proxy: p.label, avgMs: p.avgMs, success: p.totalSuccess, fail: p.totalFail }));
 
   return c.json({
     total: proxyPool.size,
-    engine: 'impit (Chrome TLS fingerprint)',
+    proven: provenList.length,
+    dead: all.filter(p => p.score >= DEAD_THRESHOLD).length,
+    untested: all.filter(p => p.lastTestedAt === 0 && p.score < DEAD_THRESHOLD).length,
     maxLatency: `${MAX_LATENCY_MS}ms`,
-    available: all.filter(p => !p.cooldown && !p.dead).length,
-    proven: all.filter(p => p.success > 0 && !p.dead).length,
-    onCooldown: all.filter(p => p.cooldown).length,
-    dead: all.filter(p => p.dead).length,
-    top10: all.slice(0, 10),
+    warmupRunning,
+    provenProxies: provenList,
   });
 });
 
-// ── Reload proxies endpoint ─────────────────────────────────
-app.post('/__reload', async (c) => {
-  purgeDead();
-  const fresh = await fetchFreshProxies();
-  const added = addToPool(fresh);
-  return c.json({ ok: true, added, total: proxyPool.size });
+// ── Reload endpoint ─────────────────────────────────────────
+app.post('/__reload', (c) => {
+  // Reset scores and re-test all
+  for (const [, state] of proxyPool) {
+    state.score = 0;
+    state.cooldownUntil = 0;
+    state.lastTestedAt = 0;
+    state.proven = false;
+  }
+  return c.json({ ok: true, total: proxyPool.size });
 });
 
-// ── Main route — ONLY through proxies ───────────────────────
+// ── Main route — ONLY proven proxies ────────────────────────
 app.all('*', async (c) => {
-  const target =
-    c.env?.TARGET_ORIGIN || process.env.TARGET_ORIGIN || 'https://m440.in';
+  const target = c.env?.TARGET_ORIGIN || process.env.TARGET_ORIGIN || 'https://m440.in';
   const url = new URL(c.req.url);
   const targetUrl = target + url.pathname + url.search;
 
@@ -352,7 +398,10 @@ app.all('*', async (c) => {
     headers['X-Requested-With'] = 'XMLHttpRequest';
   }
 
-  const maxAttempts = Math.min(proxyPool.size, 10);
+  const provenCount = Array.from(proxyPool.values()).filter(p => p.proven).length;
+  const available = provenCount > 0 ? provenCount : Array.from(proxyPool.values()).filter(p => p.score < DEAD_THRESHOLD && p.cooldownUntil <= Date.now()).length;
+  const maxAttempts = Math.min(Math.max(available, 3), 5);
+
   let lastError = '';
 
   for (let i = 0; i < maxAttempts; i++) {
@@ -362,12 +411,13 @@ app.all('*', async (c) => {
     const { entry, label } = state;
 
     try {
-      console.log(`[${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname} -> ${label} (score:${state.score}, avg:${state.avgMs}ms)`);
+      console.log(`[${i + 1}/${maxAttempts}] ${c.req.method} ${url.pathname} -> ${label} (${state.avgMs}ms)`);
       const result = await fetchViaImpit(targetUrl, entry, headers);
 
       if (isCloudflareBlock(result.text)) {
-        console.log(`  ! Cloudflare via ${label} (${result.latencyMs}ms)`);
-        state.score += 5;
+        console.log(`  ! Cloudflare via ${label}`);
+        state.proven = false; // lost trust
+        state.score += 10;
         lastError = `cloudflare via ${label}`;
         continue;
       }
@@ -380,17 +430,10 @@ app.all('*', async (c) => {
         continue;
       }
 
-      // Update latency tracking (exponential moving average)
+      // Success — update latency
       state.totalSuccess++;
       state.score = Math.max(0, state.score - 1);
-      state.avgMs = state.avgMs === 0
-        ? result.latencyMs
-        : Math.round(state.avgMs * 0.7 + result.latencyMs * 0.3);
-
-      // Penalize slow proxies (over MAX_LATENCY_MS) so faster ones get picked next
-      if (result.latencyMs > MAX_LATENCY_MS) {
-        state.score += 3;
-      }
+      state.avgMs = Math.round(state.avgMs * 0.7 + result.latencyMs * 0.3);
 
       console.log(`  OK ${result.status} via ${label} (${result.latencyMs}ms)`);
 
@@ -399,22 +442,19 @@ app.all('*', async (c) => {
       respHeaders.set('X-Proxy-Used', label);
       respHeaders.set('X-Proxy-Latency', `${result.latencyMs}ms`);
 
-      return new Response(result.body, {
-        status: result.status,
-        headers: respHeaders,
-      });
+      return new Response(result.body, { status: result.status, headers: respHeaders });
     } catch (err: any) {
       state.totalFail++;
+      state.proven = false; // lost trust
       state.score += 20;
       state.cooldownUntil = Date.now() + ERROR_COOLDOWN_MS;
-      const shortErr = err.message.split('\n')[0];
-      console.log(`  X ${label}: ${shortErr}`);
-      lastError = `${label}: ${shortErr}`;
+      console.log(`  X ${label}: ${err.message.split('\n')[0]}`);
+      lastError = `${label}: ${err.message.split('\n')[0]}`;
       continue;
     }
   }
 
-  return c.json({ error: 'All attempts failed', last: lastError }, 502);
+  return c.json({ error: 'All attempts failed', last: lastError, provenAvailable: provenCount }, 502);
 });
 
 export default app;
