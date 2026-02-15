@@ -90,7 +90,7 @@ function parseProxyList(raw: string): ProxyEntry[] {
 }
 
 // ── Load proxies from local files ────────────────────────────
-import { readFileSync } from 'fs';
+import { readFileSync, appendFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 
 function loadProxiesFromFiles(): ProxyEntry[] {
@@ -131,6 +131,36 @@ function loadProxiesFromFiles(): ProxyEntry[] {
   }
 
   return entries;
+}
+
+// ── Save fast proxies to CSV ────────────────────────────────
+const FAST_CSV = join(dirname(Bun.main), 'new_proxy_ms.csv');
+const CSV_HEADER = 'ip,anonymityLevel,asn,country,isp,latency,org,port,protocols,speed,upTime,upTimeSuccessCount,upTimeTryCount,updated_at,responseTime';
+const savedIps = new Set<string>();
+
+// Load existing entries on startup to avoid duplicates
+try {
+  if (existsSync(FAST_CSV)) {
+    const lines = readFileSync(FAST_CSV, 'utf-8').split('\n');
+    for (let i = 1; i < lines.length; i++) {
+      const ip = lines[i].split(',')[0];
+      if (ip) savedIps.add(ip);
+    }
+  }
+} catch {}
+
+function saveFastProxy(entry: ProxyEntry, latencyMs: number) {
+  const key = entry.host;
+  if (savedIps.has(key)) return;
+  savedIps.add(key);
+
+  if (!existsSync(FAST_CSV)) {
+    appendFileSync(FAST_CSV, CSV_HEADER + '\n');
+  }
+
+  const row = `${entry.host},null,null,null,null,null,null,${entry.port},${entry.type},null,null,N/A,N/A,${new Date().toISOString()},${latencyMs.toFixed(2)}`;
+  appendFileSync(FAST_CSV, row + '\n');
+  console.log(`[Save] ${entry.host}:${entry.port} (${latencyMs}ms) -> new_proxy_ms.csv`);
 }
 
 // ── Warmup: test proxies in background ──────────────────────
@@ -193,6 +223,7 @@ async function testProxy(state: ProxyState, verbose = false): Promise<boolean> {
     state.proven = true;
     state.avgMs = state.avgMs === 0 ? latencyMs : Math.round(state.avgMs * 0.7 + latencyMs * 0.3);
     state.score = Math.max(0, state.score - 2);
+    if (latencyMs < 2000) saveFastProxy(state.entry, latencyMs);
     return true;
   } catch (err: any) {
     const latencyMs = Date.now() - start;
@@ -301,7 +332,6 @@ function getNextProxy(): ProxyState | null {
   );
   if (fallback.length === 0) return null;
 
-  // Prefer untested first, then lowest score
   fallback.sort((a, b) => {
     if (a.lastTestedAt === 0 && b.lastTestedAt !== 0) return -1;
     if (a.lastTestedAt !== 0 && b.lastTestedAt === 0) return 1;
@@ -416,7 +446,7 @@ app.all('*', async (c) => {
 
       if (isCloudflareBlock(result.text)) {
         console.log(`  ! Cloudflare via ${label}`);
-        state.proven = false; // lost trust
+        state.proven = false;
         state.score += 10;
         lastError = `cloudflare via ${label}`;
         continue;
@@ -435,6 +465,8 @@ app.all('*', async (c) => {
       state.score = Math.max(0, state.score - 1);
       state.avgMs = Math.round(state.avgMs * 0.7 + result.latencyMs * 0.3);
 
+      if (result.latencyMs < 2000) saveFastProxy(entry, result.latencyMs);
+
       console.log(`  OK ${result.status} via ${label} (${result.latencyMs}ms)`);
 
       const respHeaders = new Headers();
@@ -445,7 +477,7 @@ app.all('*', async (c) => {
       return new Response(result.body, { status: result.status, headers: respHeaders });
     } catch (err: any) {
       state.totalFail++;
-      state.proven = false; // lost trust
+      state.proven = false;
       state.score += 20;
       state.cooldownUntil = Date.now() + ERROR_COOLDOWN_MS;
       console.log(`  X ${label}: ${err.message.split('\n')[0]}`);
