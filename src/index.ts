@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { Impit } from 'impit';
 
 const app = new Hono();
 app.use('*', cors());
@@ -32,8 +33,8 @@ app.all('*', async (c) => {
   if (!isJson) headers['Upgrade-Insecure-Requests'] = '1';
 
   const start = Date.now();
-  const res = await fetch(targetUrl, {
-    method: c.req.method,
+  const impit = new Impit({ browser: 'firefox' });
+  const res = await impit.fetch(targetUrl, {
     headers,
     redirect: 'follow',
   });

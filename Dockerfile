@@ -1,5 +1,7 @@
-FROM oven/bun:1 AS base
+FROM oven/bun:1
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY package.json bun.lock* ./
 RUN bun install --production

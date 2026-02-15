@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(npm install:*)",
-      "Bash(npx wrangler deploy)"
+      "Bash(npx wrangler deploy)",
+      "Bash(bun install:*)"
     ]
   }
 }
