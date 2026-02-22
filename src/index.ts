@@ -68,6 +68,6 @@ app.all('*', async (c) => {
 });
 
 export default {
-  port: parseInt(process.env.PORT || '3000'),
+  port: parseInt(process.env.PORT || '3228'),
   fetch: app.fetch,
 };
