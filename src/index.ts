@@ -7,18 +7,15 @@ app.use('*', cors());
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
 const TARGET_HOST = 'm440.in';
-const PROXY_IP = '95.214.55.66';
 const TIMEOUT_MS = 15_000;
 
 app.all('*', async (c) => {
   const url = new URL(c.req.url);
-  // Request goes to the proxy IP but with Host header set to m440.in
-  const targetUrl = `http://${PROXY_IP}${url.pathname}${url.search}`;
+  const targetUrl = `https://${TARGET_HOST}${url.pathname}${url.search}`;
   const isJson =
     url.pathname.startsWith('/lasted') || url.pathname.startsWith('/api');
 
   const headers: Record<string, string> = {
-    'Host': TARGET_HOST,
     'User-Agent': UA,
     'Accept': isJson
       ? 'application/json, text/plain, */*'
@@ -43,8 +40,7 @@ app.all('*', async (c) => {
       headers,
       redirect: 'follow',
       signal: controller.signal,
-      // @ts-ignore - Bun supports this to skip TLS verification on redirects
-      tls: { rejectUnauthorized: false },
+
     });
 
     clearTimeout(timeoutId);
