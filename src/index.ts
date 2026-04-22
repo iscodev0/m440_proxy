@@ -6,7 +6,7 @@ app.use('*', cors());
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
-const TARGET_HOST = 'm440.in';
+const TARGET_HOST = 'olympusbiblioteca.com';
 const TIMEOUT_MS = 15_000;
 
 app.all('*', async (c) => {
@@ -63,7 +63,4 @@ app.all('*', async (c) => {
   }
 });
 
-export default {
-  port: parseInt(process.env.PORT || '3228'),
-  fetch: app.fetch,
-};
+export default app;

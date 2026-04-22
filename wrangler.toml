@@ -1,0 +1,6 @@
+name = "m440-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-04-05"
+
+[observability]
+enabled = true
